@@ -1,0 +1,181 @@
+"""Headless smoke test of the staged demo path:
+County > City > Larimer (Step 1 Community) > Step 2 perspective > Step 3 opportunity > example lot (Step 4 futures) > Step 5 trade-offs.
+
+Usage:  (cd src/app && python3 -m http.server 8795) &   then   .venv/bin/python tests/smoke_app.py [--shots DIR]
+Set APP_URL to test another port. Needs `pip install playwright` and a local Chrome (channel="chrome"). Exit code 1 on failure.
+"""
+
+import os
+import sys
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+URL = os.environ.get("APP_URL", "http://localhost:8795/")
+shots = Path(sys.argv[sys.argv.index("--shots") + 1]) if "--shots" in sys.argv else None
+fails, errors = [], []
+
+
+def check(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        fails.append(msg)
+
+
+def shot(page, name):
+    if shots:
+        shots.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(shots / f"{name}.png"), full_page=False)
+
+
+with sync_playwright() as pw:
+    browser = pw.chromium.launch(channel="chrome", headless=True)
+    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    page.on("console", lambda m: m.type == "error" and errors.append(m.text))
+    page.on("pageerror", lambda e: errors.append(str(e)))
+
+    t0 = time.time()
+    page.goto(URL)
+    page.wait_for_selector("#countyInd", timeout=20000)
+    page.wait_for_function("document.querySelector('#legend') && !document.querySelector('#legend').hidden", timeout=20000)
+    check(True, f"county overview loaded in {time.time() - t0:.1f}s")
+    page.wait_for_function("window.__hfMap && window.__hfMap.loaded() && window.__hfMap.queryRenderedFeatures({layers: ['muni-fill']}).length > 50", timeout=20000)
+    check(True, "county choropleth rendered")
+    check(page.get_attribute("#journey [aria-current=step]", "data-stage") == "community", "journey starts at Step 1 Community")
+    shot(page, "1-county")
+
+    page.click("[data-go=city]")
+    page.wait_for_selector("#hoodInd", timeout=10000)
+    check("90 neighborhoods" in page.inner_text("#parcelCard"), "City panel shows 90 neighborhoods")
+    page.select_option("#hoodInd", "vacant")
+    page.wait_for_timeout(1800)
+    shot(page, "2-city")
+
+    t1 = time.time()
+    page.fill("#search", "Larimer")
+    page.press("#search", "Enter")
+    page.wait_for_function("document.querySelector('.needs-card h2')?.textContent.startsWith('What does')", timeout=20000)
+    load_s = time.time() - t1
+    h2 = page.inner_text(".needs-card h2")
+    check(h2 == "What does Larimer need?", f"needs panel title: {h2!r} (loaded in {load_s:.1f}s)")
+    n_needs = page.locator(".need").count()
+    check(n_needs >= 3, f"{n_needs} needs flagged for Larimer")
+    check("Context, never a score" in page.inner_text("#environment"), "police / smell shown as context, not a score")
+    check("score" not in page.inner_text(".needs").lower(), "no safety score wording in needs list")
+    page.wait_for_timeout(1200)
+    shot(page, "3-larimer-needs")
+
+    page.click("[data-go-stage=perspective]")
+    page.wait_for_selector("#perspective .role-tabs")
+    check(page.locator("#perspective [data-role]").count() == 5, "Step 2: five stakeholder tabs")
+    check(page.locator("#perspective .sl").count() == 10, "Step 2: 10 criteria sliders")
+    total = lambda: page.eval_on_selector_all("#perspective [data-w]", "xs => xs.reduce((s, x) => s + +x.value, 0)")
+    check(total() == 100, "weights start at 100")
+    page.eval_on_selector("#perspective [data-w=homes]", "x => { x.value = 47; x.dispatchEvent(new Event('input', {bubbles: true})); }")
+    check(total() == 100 and page.input_value("#perspective [data-w=homes]") == "47", f"moving a slider keeps the total at 100 ({total()})")
+    page.click("#perspective [data-preset=climate]")
+    check(page.locator("#perspective [data-preset=climate].on").count() == 1 and total() == 100, "preset applies and sums to 100")
+    if page.locator("#perspective [data-emph]").count():
+        page.click("#perspective [data-emph]")
+        check(total() == 100, "needs-based emphasis applied on request, sums to 100")
+    page.click("#perspective [data-role=community]")
+    shot(page, "3b-perspective")
+
+    page.click("[data-go-stage=opportunity]")
+    page.wait_for_selector(".opp-card .opp-grid")
+    check(page.locator(".opp-card .opp").count() >= 5, "Step 3: opportunity layer toggles")
+
+    page.click("#tryExample")
+    page.wait_for_selector(".fcard", timeout=20000)
+    cards = page.locator(".fcard").count()
+    check(cards >= 3, f"{cards} housing-future cards for the first example lot")
+    check("City of Pittsburgh" in page.inner_text("#parcelCard"), "parcel card shows public owner")
+    check(page.locator(".tags .tag").count() >= 1, "opportunity tags on the parcel card")
+    check(page.locator("#planningFor .wstrip").count() == 1, "Step 4: weights strip above the ranking")
+    page.wait_for_timeout(1200)
+    shot(page, "4-parcel")
+
+    sugg = page.locator(".tp.on").count()
+    check(1 <= sugg <= 4, f"type picker: {sugg} types preselected from needs")
+
+    page.locator(".fcard .whynot").first.click()
+    page.wait_for_selector(".drawer", timeout=10000)
+    check(page.get_attribute("#journey [aria-current=step]", "data-stage") == "tradeoffs", "WHY NOT? opens Step 5 Trade-offs")
+    check(page.locator(".cons li, .drawer p").count() >= 1, "Why-not drawer opens")
+    shot(page, "5-why")
+
+    check(page.locator(".ptile").count() == 3, "performance tiles: compactness, transit, green space")
+    check(not page.eval_on_selector("#solarMore", "d => d.open"), "winter-sun goal collapsed by default")
+    check(page.locator(".axo-big path[stroke='#2F7FB8']").count() == 0, "solar mesh off by default")
+    page.click("#solarMore summary")
+    solar_txt = page.inner_text(".solar-a")
+    page.select_option("#solarWindow", "day")
+    page.wait_for_timeout(300)
+    check(page.eval_on_selector("#solarMore", "d => d.open"), "winter-sun section stays open after a re-render")
+    check(page.inner_text(".solar-a") != solar_txt or "9–15" in page.inner_text(".solar-a"), "solar window control recomputes the envelope")
+    page.check("#solarToggle")
+    check(page.locator(".axo-big path[stroke='#2F7FB8']").count() > 4, "solar envelope mesh drawn on request")
+    check("not current Pittsburgh law" in page.inner_text("#why"), "Why panel lists community goals as not current law")
+    page.locator(".axo-big").scroll_into_view_if_needed()
+    shot(page, "5b-performance")
+    page.select_option("#solarWindow", "noon2")
+    page.uncheck("#solarToggle")
+
+    page.locator(".rendering img").scroll_into_view_if_needed()
+    page.wait_for_function("document.querySelector('.rendering img')?.complete", timeout=10000)
+    check(page.eval_on_selector(".rendering img", "i => i.naturalWidth") > 0, "illustration for the selected type loads")
+    check("/renderings/" in page.eval_on_selector(".rendering img", "i => i.currentSrc"), "warm original render used")
+    check("not a design for this site" in page.inner_text(".rendering figcaption"), "illustration carries the AI disclosure label")
+    shot(page, "5d-rendering")
+
+    check(page.locator("#cost .cost-card").count() == 1, "cost explorer in Trade-offs")
+    check(page.locator(".prank li").count() == cards, "every compared future is ranked")
+    check("priority mixes" in page.inner_text("#prioRank"), "SMAA robustness line shown")
+
+    page.click("#journey [data-stage=futures]")
+    page.wait_for_selector("#setSelect option", state="attached")
+    presets = page.eval_on_selector_all("#setSelect option", "os => os.map(o => o.value)")
+    page.click("#tryExample")
+    page.wait_for_function("document.querySelector('#exampleNote')?.textContent.includes('2 of 3')", timeout=20000)
+    page.click("#tryExample")
+    page.wait_for_function("document.querySelector('#exampleNote')?.textContent.includes('3 of 3')", timeout=20000)
+    page.wait_for_selector(".fcard", timeout=20000)
+    for key in presets:
+        page.select_option("#setSelect", key)
+        page.wait_for_timeout(250)
+        n = page.locator(".fcard").count()
+        check(n >= 2, f"preset {key!r} on the garage lot: {n} cards")
+        if key == "gentle":
+            shot(page, "6-gentle-garage")
+    before = page.locator(".fcard").count()
+    page.click("#typeOptions summary")
+    page.locator(".tp:not(.on):not([disabled])").first.click()
+    page.wait_for_timeout(250)
+    check(page.locator(".fcard").count() == min(before + 1, 4), "adding a type adds a card")
+    check(page.input_value("#setSelect") == "custom", "custom mix selected after toggling a type")
+
+    page.click("#tryExample")
+    page.wait_for_timeout(1500)
+    check(page.locator(".fcard").count() >= 1 or page.locator(".oos").count() == 1, "cycled through all examples")
+
+    timing = page.evaluate("""async () => {
+      const city = await (await fetch('data/city/neighborhoods.json')).json();
+      const out = [];
+      for (const h of city.hoods) {
+        const t = performance.now();
+        const d = await (await fetch(`data/city/nbhd/${h.slug}.json`, {cache: 'no-store'})).json();
+        out.push([h.slug, performance.now() - t, d.parcels.length]);
+      }
+      return out;
+    }""")
+    worst = max(timing, key=lambda r: r[1])
+    check(len(timing) == 90 and all(r[2] > 0 for r in timing), "all 90 neighborhood files load and parse")
+    check(worst[1] < 3000, f"slowest neighborhood file (local fetch + parse): {worst[0]} {worst[1]:.0f} ms")
+
+    extra = [e for e in errors if "tiles.openfreemap" not in e and "Failed to load resource" not in e]
+    check(not extra, f"no JavaScript errors ({len(extra)})" + ("".join("\n     " + e[:200] for e in extra[:5])))
+    browser.close()
+
+print("\nFAILED" if fails else "\nSmoke test passed.")
+sys.exit(1 if fails else 0)
